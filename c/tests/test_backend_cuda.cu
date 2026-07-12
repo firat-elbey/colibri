@@ -6,14 +6,20 @@
 #include <cstdlib>
 #include <cstring>
 
-static int close_enough(const float *got, const float *want, int n) {
+/* Matmul checks keep the strict 1e-4 gate (inputs are exact binary fractions,
+ * so any summation order matches); only the FFN test passes a looser eps
+ * because GPU expf inside silu differs from host expf in the last ulps. */
+static int close_eps(const float *got, const float *want, int n, float eps) {
     for (int i = 0; i < n; i++) {
-        if (std::fabs(got[i] - want[i]) > 1e-3f) {
+        if (std::fabs(got[i] - want[i]) > eps) {
             std::fprintf(stderr, "mismatch %d: got %.6f want %.6f\n", i, got[i], want[i]);
             return 0;
         }
     }
     return 1;
+}
+static int close_enough(const float *got, const float *want, int n) {
+    return close_eps(got, want, n, 1e-4f);
 }
 
 /* CPU reference: dequant-on-use, identical container semantics to the engine. */
@@ -153,7 +159,7 @@ static int test_ffn_async(int device) {
             float want[NR * D];
             for (int r = 0; r < NR; r++) {
                 const float *xr = x + (size_t)rows[r] * D;
-                float gv[FI], uv[FI];
+                float gv[FI];
                 for (int o = 0; o < FI; o++) {
                     float a = 0, b = 0;
                     for (int i = 0; i < D; i++) {
@@ -161,7 +167,6 @@ static int test_ffn_async(int device) {
                         b += xr[i] * wref(uq[e], us[e], 1, D, o, i);
                     }
                     gv[o] = a / (1.f + std::exp(-a)) * b;
-                    (void)uv;
                 }
                 for (int o = 0; o < D; o++) {
                     float a = 0;
@@ -169,7 +174,7 @@ static int test_ffn_async(int device) {
                     want[(size_t)r * D + o] = a;
                 }
             }
-            if (!close_enough(hh[e], want, NR * D)) {
+            if (!close_eps(hh[e], want, NR * D, 1e-3f)) {
                 std::fprintf(stderr, "ffn result mismatch expert %d round %d\n", e, round);
                 return 0;
             }

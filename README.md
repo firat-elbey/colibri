@@ -290,12 +290,14 @@ least-loaded device that can hold them. A NUMA-local RAM backing store is not
 implemented yet.
 
 Current limitations: devices use independent contexts—there is no P2P/NCCL
-dependency yet. Within one device, weight uploads and kernels share a single
-stream, so copy/compute do not overlap; streamed weights transfer from pageable
-memory. The kernels use vectorized dequant-on-use loads with warp reductions
-(warp-per-row for decode, an 8-position weight-reuse tile for batches) rather
-than cuBLAS/Tensor Cores. End-to-end numbers on the full model are still the
-missing measurement — see `GPU_TIER_HANDOFF.md` for the validation protocol.
+dependency yet. Each device runs two streams (async expert FFNs; synchronous
+batch streaming) so the tiers never stall each other, but within a tier weight
+uploads and kernels still serialize, and streamed weights transfer from
+pageable memory. The kernels use vectorized dequant-on-use loads with warp
+reductions (warp-per-row for decode, a 16-position weight-reuse tile for
+batches) rather than cuBLAS/Tensor Cores. End-to-end numbers on the full model
+are still the missing measurement — see `GPU_TIER_HANDOFF.md` for the
+validation protocol.
 
 For a reproducible backend A/B without the full checkpoint, generate the
 deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:

@@ -19,10 +19,17 @@ the ~370 GB GLM-5.2 int4 container, Linux, CUDA toolkit ≥ 12.x installed.
 | `c/glm.c` | `moe()`: VRAM-pinned experts are now **enqueued asynchronously** and the CPU computes the remaining experts while the GPU works (previously the GPU serialized into the critical path); results collected at an end-of-block sync. `matmul_qt()`: batches of ≥ `CUDA_PREFILL_ROWS` rows on non-resident tensors stream weights over PCIe once and run on the GPU — this accelerates prefill (dense projections, shared experts, and batch-union routed experts all pass through this seam). `repin_pass()` drains the stream before freeing device weights. New env knobs + stats. |
 | `c/tests/test_backend_cuda.cu` | Extended: tile kernel vs CPU reference on all 4 formats, streamed matmul, scalar-fallback shapes, async FFN (out-of-order row gather, double enqueue + single sync, arena reuse across syncs, dimension-mismatch rejection, leak check). References are computed in-test; inputs are exact binary fractions so any summation order must match. |
 
-New environment knobs (all existing ones unchanged):
+New environment knobs: `CUDA_PREFILL` and `CUDA_PREFILL_ROWS` — semantics and
+defaults are documented in the README's CUDA section (single source of truth;
+this file intentionally does not restate them). Weight streaming engages only
+in prefill forwards (`pos_base==0`): decode and MTP/grammar verify batches
+never re-stream weights per token, whatever their S.
 
-- `CUDA_PREFILL=0` — disable the batch weight-streaming path (default on when `COLI_CUDA=1`).
-- `CUDA_PREFILL_ROWS=n` — minimum batch rows before weights are streamed through PCIe (default 16).
+One stats caveat for A/B comparisons: on `main`, `chiamate servite da VRAM`
+counted every routed call to a VRAM-eligible expert (even ones that then fell
+back to CPU); on this branch it counts successfully *enqueued* async FFNs. The
+branch number is the honest one, but do not read a small drop vs `main` as a
+regression.
 
 ## What you (local Claude) need to do
 
@@ -93,7 +100,7 @@ All runs: `COLI_MODEL=/nvme/glm52_i4`, int8 MTP head installed, same prompt
 set. Capture the full per-turn stats lines.
 
 ```bash
-# A. CPU baseline (warm cache, learned pin — run twice, report 2nd)
+# A. CPU baseline (warm cache, learned pin — >=3 measured runs after warm-up, report median)
 ./coli chat --ngen 32 --temp 0
 
 # B. + async VRAM expert tier (the 5090 holds dense projections + hot experts)
@@ -124,19 +131,34 @@ C the wall-clock prefill segment specifically.
 ### Stage 5 — report
 
 Open one summary (GitHub issue on the fork, or a markdown file next to this
-one) containing: hardware, driver/toolkit versions, every stage's pass/fail,
-the A/B/C numbers with their stats lines, and any `[CUDA]` stderr warnings
-seen. If everything passes and B/C show wins, this branch is ready to be
+one). CONTRIBUTING.md defines the required benchmark-report fields — include
+all of them: **commit** (this branch's HEAD SHA), **exact commands**, hardware
+AND **storage details** (drive model, filesystem, `iobench` numbers),
+**warm-up policy** (state how many warm-up runs preceded measurement; the
+learned pin/`.coli_usage` state counts as warm-up and must be stated),
+**run count**, and **median throughput** across runs (≥3 measured runs per
+configuration, not "run twice, report the 2nd"). Add: driver/toolkit versions,
+every stage's pass/fail, the A/B/C stats lines verbatim, and any `[CUDA]`
+stderr warnings seen. Running `make -C c cuda-test CUDA_ARCH=native` in
+Stage 1 is what satisfies CONTRIBUTING.md's requirement that CUDA changes be
+checked on a CUDA-capable Linux host — until then this branch has NOT met that
+gate. If everything passes and B/C show wins, this branch is ready to be
 offered upstream (JustVugg/colibri) — the author explicitly requests exactly
 these measurements in the README.
 
 ## Known limitations (do not "fix" during validation — note them)
 
-1. One stream per device: within a single device, weight H2D copies and
-   kernels serialize; double-buffered copy/compute overlap is a follow-up.
+1. Two streams per device isolate the async FFN tier from the synchronous
+   streaming tier, but within each tier weight H2D copies and kernels still
+   serialize; double-buffered copy/compute overlap is a follow-up.
 2. Streamed weights transfer from pageable memory (the expert cache), not
-   pinned staging — effective PCIe bandwidth is below peak.
+   pinned staging — effective PCIe bandwidth is below peak. (Follow-up:
+   `cudaHostRegister` the expert-cache slabs at load time.)
 3. The GPU FFN accumulates in f32 over dequantized weights, matching the CPU
    non-idot path, not the idot path — last-ulp logit differences are expected.
 4. On VRAM exhaustion the streaming path disables itself after 8 consecutive
-   failures and logs once; the run continues on CPU. That's by design.
+   failures and logs once; a failed async FFN sync marks those experts
+   CPU-only and recomputes them on the CPU. The run always continues with
+   correct output. That's by design.
+5. Async-FFN staging arenas are capped (~64 MB pinned per collection window)
+   by flushing early; blocks are retained until shutdown by design.

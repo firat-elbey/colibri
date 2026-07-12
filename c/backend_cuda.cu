@@ -44,7 +44,9 @@ typedef struct ArenaBlock {
 
 typedef struct {
     int device;
-    cudaStream_t stream;
+    cudaStream_t stream;                   /* async FFN tier (arena-backed ops) */
+    cudaStream_t sstream;                  /* synchronous matmul/stream tier — separate so a
+                                            * synchronous call never drains pending FFN work */
     ArenaBlock *pin, *dev;                 /* transient staging, reset on sync */
     void *wbuf; size_t wcap;               /* persistent scratch: streamed weights */
     float *wsc; size_t wsc_cap;            /* persistent scratch: streamed row scales */
@@ -130,18 +132,19 @@ __device__ static inline float warp_sum(float v) {
     return v;
 }
 
+/* Container dequant, one copy of each formula: the j-th weight inside a packed
+ * uint32 chunk (int8: 4/chunk, int4 low-nibble-first: 8, int2 LSB-first: 16). */
+__device__ static inline float dq_i8(uint32_t c, int j) { return (float)(int8_t)(c >> (8 * j)); }
+__device__ static inline float dq_i4(uint32_t c, int j) { return (float)((int)((c >> (4 * j)) & 15u) - 8); }
+__device__ static inline float dq_i2(uint32_t c, int j) { return (float)((int)((c >> (2 * j)) & 3u) - 2); }
+
 /* Scalar dequant, identical semantics to the CPU dequant-on-use path. */
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
-    const uint8_t *q = base;
-    if (fmt == 2) {
-        uint8_t v = q[i >> 1];
-        return static_cast<float>(((i & 1) ? (v >> 4) : (v & 15)) - 8);
-    }
-    uint8_t v = q[i >> 2];
-    return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
+    if (fmt == 2) return dq_i4(base[i >> 1], i & 1);
+    return dq_i2(base[i >> 2], i & 3);
 }
 
 /* One warp per output row, one position per grid.y — decode / tiny batches. */
@@ -168,7 +171,7 @@ __global__ static void k_matvec(float *y, const float *x, const void *w, const f
             uint32_t c = wq[k];
             const float *xb = xs + ((size_t)k << 2);
             #pragma unroll
-            for (int j = 0; j < 4; j++) sum += xb[j] * (float)(int8_t)(c >> (8 * j));
+            for (int j = 0; j < 4; j++) sum += xb[j] * dq_i8(c, j);
         }
     } else if (fmt == 2) {
         const uint32_t *wq = (const uint32_t *)row;
@@ -176,7 +179,7 @@ __global__ static void k_matvec(float *y, const float *x, const void *w, const f
             uint32_t c = wq[k];
             const float *xb = xs + ((size_t)k << 3);
             #pragma unroll
-            for (int j = 0; j < 8; j++) sum += xb[j] * (float)((int)((c >> (4 * j)) & 15u) - 8);
+            for (int j = 0; j < 8; j++) sum += xb[j] * dq_i4(c, j);
         }
     } else {
         const uint32_t *wq = (const uint32_t *)row;
@@ -184,7 +187,7 @@ __global__ static void k_matvec(float *y, const float *x, const void *w, const f
             uint32_t c = wq[k];
             const float *xb = xs + ((size_t)k << 4);
             #pragma unroll
-            for (int j = 0; j < 16; j++) sum += xb[j] * (float)((int)((c >> (2 * j)) & 3u) - 2);
+            for (int j = 0; j < 16; j++) sum += xb[j] * dq_i2(c, j);
         }
     }
     sum = warp_sum(sum);
@@ -194,7 +197,7 @@ __global__ static void k_matvec(float *y, const float *x, const void *w, const f
 /* One output row per blockIdx.x, COLI_TS positions per blockIdx.y: the weight row
  * is fetched once and reused for the whole tile — this is what makes batch work
  * (prefill, MTP verify) compute-bound on the GPU instead of bandwidth-bound. */
-#define COLI_TS 8
+#define COLI_TS 16
 
 __global__ static void k_matmul_tile(float *y, const float *x, const void *w, const float *scales,
                                      int fmt, int S, int I, int O, size_t rb, int vec) {
@@ -227,7 +230,7 @@ __global__ static void k_matmul_tile(float *y, const float *x, const void *w, co
             int ib = k << 2;
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                float wv = (float)(int8_t)(c >> (8 * j));
+                float wv = dq_i8(c, j);
                 for (int t = 0; t < ns; t++) acc[t] += wv * x[(size_t)(s0 + t) * I + ib + j];
             }
         }
@@ -238,7 +241,7 @@ __global__ static void k_matmul_tile(float *y, const float *x, const void *w, co
             int ib = k << 3;
             #pragma unroll
             for (int j = 0; j < 8; j++) {
-                float wv = (float)((int)((c >> (4 * j)) & 15u) - 8);
+                float wv = dq_i4(c, j);
                 for (int t = 0; t < ns; t++) acc[t] += wv * x[(size_t)(s0 + t) * I + ib + j];
             }
         }
@@ -249,12 +252,12 @@ __global__ static void k_matmul_tile(float *y, const float *x, const void *w, co
             int ib = k << 4;
             #pragma unroll
             for (int j = 0; j < 16; j++) {
-                float wv = (float)((int)((c >> (2 * j)) & 3u) - 2);
+                float wv = dq_i2(c, j);
                 for (int t = 0; t < ns; t++) acc[t] += wv * x[(size_t)(s0 + t) * I + ib + j];
             }
         }
     }
-    __shared__ float red[COLI_TS][4];
+    __shared__ float red[COLI_TS][32];    /* sized for any block up to 1024 threads */
     int lane = tid & 31, wid = tid >> 5, nw = nth >> 5;
     #pragma unroll
     for (int t = 0; t < COLI_TS; t++) {
@@ -293,9 +296,15 @@ static void launch_matmul(cudaStream_t st, float *y, const float *x, const void 
     if (S < 4) {
         dim3 grid((unsigned)((O + 3) / 4), (unsigned)S);
         k_matvec<<<grid, 128, 0, st>>>(y, x, w, scales, fmt, I, O, rb, vec);
-    } else {
-        dim3 grid((unsigned)O, (unsigned)((S + COLI_TS - 1) / COLI_TS));
-        k_matmul_tile<<<grid, 128, 0, st>>>(y, x, w, scales, fmt, S, I, O, rb, vec);
+        return;
+    }
+    /* gridDim.y is capped at 65535: chunk very long batches over positions */
+    const int max_pos = 65535 * COLI_TS;
+    for (int s0 = 0; s0 < S; s0 += max_pos) {
+        int ns = S - s0 < max_pos ? S - s0 : max_pos;
+        dim3 grid((unsigned)O, (unsigned)((ns + COLI_TS - 1) / COLI_TS));
+        k_matmul_tile<<<grid, 128, 0, st>>>(y + (size_t)s0 * O, x + (size_t)s0 * I,
+                                            w, scales, fmt, ns, I, O, rb, vec);
     }
 }
 
@@ -324,7 +333,8 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if (!select_ctx(ctx)) { g_nctx = 0; return 0; }
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { g_nctx = 0; return 0; }
-        if (!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking), "stream create")) {
+        if (!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking), "stream create") ||
+            !cuda_ok(cudaStreamCreateWithFlags(&ctx->sstream, cudaStreamNonBlocking), "sync stream create")) {
             g_nctx = 0;
             return 0;
         }
@@ -341,6 +351,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (!select_ctx(ctx)) continue;
         cudaStreamSynchronize(ctx->stream);
         cudaStreamDestroy(ctx->stream);
+        cudaStreamSynchronize(ctx->sstream);
+        cudaStreamDestroy(ctx->sstream);
         arena_free(&ctx->pin, 1);
         arena_free(&ctx->dev, 0);
         if (ctx->wbuf) cudaFree(ctx->wbuf);
@@ -418,11 +430,11 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve_bytes((void **)&ctx->xbuf, &ctx->x_cap, xb, "x scratch") ||
         !reserve_bytes((void **)&ctx->ybuf, &ctx->y_cap, yb, "y scratch")) return 0;
-    if (!cuda_ok(cudaMemcpyAsync(ctx->xbuf, x, xb, cudaMemcpyHostToDevice, ctx->stream), "input upload")) return 0;
-    launch_matmul(ctx->stream, ctx->ybuf, ctx->xbuf, t->weights, t->scales, fmt, S, I, O);
+    if (!cuda_ok(cudaMemcpyAsync(ctx->xbuf, x, xb, cudaMemcpyHostToDevice, ctx->sstream), "input upload")) return 0;
+    launch_matmul(ctx->sstream, ctx->ybuf, ctx->xbuf, t->weights, t->scales, fmt, S, I, O);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
-        !cuda_ok(cudaMemcpyAsync(y, ctx->ybuf, yb, cudaMemcpyDeviceToHost, ctx->stream), "output download") ||
-        !cuda_ok(cudaStreamSynchronize(ctx->stream), "matmul sync")) return 0;
+        !cuda_ok(cudaMemcpyAsync(y, ctx->ybuf, yb, cudaMemcpyDeviceToHost, ctx->sstream), "output download") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->sstream), "matmul sync")) return 0;
     return 1;
 }
 
@@ -440,14 +452,14 @@ extern "C" int coli_cuda_matmul_stream(float *y, const float *x,
         !reserve_bytes((void **)&ctx->ybuf, &ctx->y_cap, yb, "y scratch")) return 0;
     if (fmt && !reserve_bytes((void **)&ctx->wsc, &ctx->wsc_cap, (size_t)O * sizeof(float),
                               "streamed scales scratch")) return 0;
-    if (!cuda_ok(cudaMemcpyAsync(ctx->wbuf, weights, wb, cudaMemcpyHostToDevice, ctx->stream), "weights upload")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(ctx->wbuf, weights, wb, cudaMemcpyHostToDevice, ctx->sstream), "weights upload")) return 0;
     if (fmt && !cuda_ok(cudaMemcpyAsync(ctx->wsc, scales, (size_t)O * sizeof(float),
-                                        cudaMemcpyHostToDevice, ctx->stream), "scales upload")) return 0;
-    if (!cuda_ok(cudaMemcpyAsync(ctx->xbuf, x, xb, cudaMemcpyHostToDevice, ctx->stream), "input upload")) return 0;
-    launch_matmul(ctx->stream, ctx->ybuf, ctx->xbuf, ctx->wbuf, fmt ? ctx->wsc : nullptr, fmt, S, I, O);
+                                        cudaMemcpyHostToDevice, ctx->sstream), "scales upload")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(ctx->xbuf, x, xb, cudaMemcpyHostToDevice, ctx->sstream), "input upload")) return 0;
+    launch_matmul(ctx->sstream, ctx->ybuf, ctx->xbuf, ctx->wbuf, fmt ? ctx->wsc : nullptr, fmt, S, I, O);
     if (!cuda_ok(cudaGetLastError(), "streamed matmul launch") ||
-        !cuda_ok(cudaMemcpyAsync(y, ctx->ybuf, yb, cudaMemcpyDeviceToHost, ctx->stream), "output download") ||
-        !cuda_ok(cudaStreamSynchronize(ctx->stream), "streamed matmul sync")) return 0;
+        !cuda_ok(cudaMemcpyAsync(y, ctx->ybuf, yb, cudaMemcpyDeviceToHost, ctx->sstream), "output download") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->sstream), "streamed matmul sync")) return 0;
     return 1;
 }
 
@@ -489,7 +501,10 @@ extern "C" int coli_cuda_sync(int device) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (device >= 0 && ctx->device != device) continue;
-        if (!select_ctx(ctx) || !cuda_ok(cudaStreamSynchronize(ctx->stream), "stream sync")) { ok = 0; continue; }
+        if (!select_ctx(ctx) || !cuda_ok(cudaStreamSynchronize(ctx->stream), "stream sync")) ok = 0;
+        /* reset even after a failed sync: the results are unusable either way and
+         * the caller falls back to CPU — never resetting would leak a fresh arena
+         * block per enqueue for the rest of the run */
         arena_reset(ctx->pin);
         arena_reset(ctx->dev);
     }

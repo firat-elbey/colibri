@@ -50,6 +50,7 @@ def main() -> None:
     for key in (
         "COLI_CUDA", "COLI_GPU", "COLI_GPUS", "CUDA_EXPERT_GB",
         "PIN", "PIN_GB", "STATS", "TF", "REPLAY", "CUDA_DENSE",
+        "CUDA_PREFILL", "CUDA_PREFILL_ROWS",
     ):
         base.pop(key, None)
     base.update(
