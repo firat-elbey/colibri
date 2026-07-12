@@ -152,6 +152,10 @@ static double g_cuda_expert_gb;
 static int g_cuda_dense;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
+static int g_cuda_prefill=1;        /* CUDA_PREFILL=0: no batch streaming through PCIe */
+static int g_cuda_prefill_rows=16;  /* CUDA_PREFILL_ROWS: min rows for PCIe to pay for itself */
+static uint64_t g_cuda_stream_calls;
+static int g_cuda_stream_fails;
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
@@ -164,6 +168,8 @@ static int qt_cuda_upload(QT *t){
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    if(g_cuda_stream_calls) fprintf(stderr,"[CUDA] streamed batch matmul (prefill tier): %llu\n",
+        (unsigned long long)g_cuda_stream_calls);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
@@ -485,6 +491,22 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
         w->cuda_failed=1;
         fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
+    }
+    /* Large batch on a NON-resident tensor: the weights cross PCIe once and are
+     * reused for all S rows, so on prefill-sized batches the GPU beats the CPU
+     * matmul from a few dozen rows up. Covers dense prefill, shared experts and
+     * streamed routed experts alike (they all land here via matmul_qt). After 8
+     * consecutive failures (VRAM full) the path turns itself off. */
+    if(g_cuda_enabled && g_cuda_prefill && !w->cuda_eligible && S>=g_cuda_prefill_rows
+       && g_cuda_stream_fails<8 && !omp_in_parallel()){
+        const void *weights = w->fmt==0 ? (const void*)w->qf
+                            : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        int dev=g_cuda_devices[g_cuda_rr++%g_cuda_ndev];
+        if(coli_cuda_matmul_stream(y,x,weights,w->s,w->fmt,S,w->I,w->O,dev)){
+            g_cuda_stream_calls++; g_cuda_stream_fails=0; return;
+        }
+        if(++g_cuda_stream_fails==8)
+            fprintf(stderr,"[CUDA] batch streaming disabled after 8 errors; continuing on CPU\n");
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -1267,6 +1289,17 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
+/* rows/weights of the batch positions routed to expert eid (deterministic order:
+ * ascending position). Shared by the compute loop and the async GPU collection,
+ * which must reproduce the exact row order of the enqueued gather. */
+static int expert_rows(const int *idxs, const float *wsv, const int *keff,
+                       int S, int K, int eid, int *rows, float *rw){
+    int nr=0;
+    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+        if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=wsv[(int64_t)s*K+kk]; nr++; break; }
+    return nr;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     float *logit=falloc(E), *choice=falloc(E);
@@ -1359,17 +1392,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
+#ifdef COLI_CUDA
+        int pj[64]; float *phh[64]; int npend=0;
+#endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
             /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
              * dispatched slot must be waited before the end-of-block LRU swap can reuse
              * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant. */
             if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk += now_s()-tw; }
-            int nr=0;                                 /* righe (posizioni) che usano questo expert */
-            for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+            int nr=expert_rows(idxs,ws,keff,S,K,eid,rows,rw);
             if(!nr) continue;
 #ifdef COLI_CUDA
-            if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
+            /* VRAM-pinned expert: enqueue the whole FFN on the device stream and
+             * move on — the CPU computes the remaining experts WHILE the GPU
+             * works, instead of serializing behind it. Results are collected at
+             * the end-of-block sync below. */
+            if(g_cuda_enabled && e->g.cuda_eligible && !e->g.cuda_failed
+               && e->g.cuda && e->u.cuda && e->d.cuda){
+                float *hh_gpu=NULL;
+                if(coli_cuda_ffn_enqueue(e->g.cuda,e->u.cuda,e->d.cuda,x,rows,nr,&hh_gpu)){
+                    m->gpu_expert_calls++; pj[npend]=j; phh[npend++]=hh_gpu; continue;
+                }
+                e->g.cuda_failed=1;   /* fall through to CPU; slot stays RAM-resident */
+            }
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
@@ -1385,6 +1430,21 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
          * cursor keeps any still-spinning worker off a wrong-generation slot. */
+#ifdef COLI_CUDA
+        if(npend){   /* the GPU worked while the CPU loop ran; collect and accumulate */
+            double t0=now_s();
+            coli_cuda_sync(-1);
+            for(int p=0;p<npend;p++){
+                int eid=uniq[base+pj[p]];
+                int nr=expert_rows(idxs,ws,keff,S,K,eid,rows,rw);
+                const float *hr=phh[p];
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r];
+                    const float *hg=hr+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hg[d]; }
+            }
+            m->t_emm += now_s()-t0;
+        }
+#endif
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -2035,6 +2095,11 @@ static void repin_pass(Model *m){
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
     RepinCand cd[4]; int nb=repin_pick(m,cd,4);
+#ifdef COLI_CUDA
+    /* drain the stream first: no in-flight FFN may reference device weights that
+     * the swap below frees and re-uploads */
+    if(nb && g_cuda_enabled) coli_cuda_sync(-1);
+#endif
     for(int b=0;b<nb;b++){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
         int old=s->eid;
@@ -2679,6 +2744,11 @@ int main(int argc, char **argv){
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+    g_cuda_prefill=getenv("CUDA_PREFILL")?atoi(getenv("CUDA_PREFILL")):1;
+    if(getenv("CUDA_PREFILL_ROWS")){
+        g_cuda_prefill_rows=atoi(getenv("CUDA_PREFILL_ROWS"));
+        if(g_cuda_prefill_rows<1) g_cuda_prefill_rows=1;
+    }
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
